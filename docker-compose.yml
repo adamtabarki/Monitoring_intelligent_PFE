@@ -1,0 +1,133 @@
+version: "3.9"
+
+networks:
+  monitoring_net:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  postgres_data:
+  ollama_data:
+  n8n_data:
+
+services:
+
+  watchdog:
+    image: alpine:latest
+    container_name: watchdog
+    networks: [monitoring_net]
+    restart: unless-stopped
+    environment:
+      - HEARTBEAT_URL=${HEARTBEAT_URL:-https://example.com}
+    command: >
+      sh -c "
+        echo 'Watchdog started.';
+        while true; do
+          wget -q --spider \"$$HEARTBEAT_URL\";
+          if [ $$? -eq 0 ]; then echo '[watchdog] OK';
+          else echo '[watchdog] ping failed'; fi;
+          sleep 60;
+        done
+      "
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    networks: [monitoring_net]
+    ports: ["9090:9090"]
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks: [monitoring_net]
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on: [prometheus]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    networks: [monitoring_net]
+    ports: ["5432:5432"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monitoring
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  ai-engine:
+    build: ./ai-engine
+    container_name: ai-engine
+    networks: [monitoring_net]
+    ports: ["8000:8000"]
+    restart: unless-stopped
+    volumes:
+      - ./ai-engine/persistence:/app/persistence
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+      - DATABASE_URL=postgresql://monitor:monitor123@postgres:5432/monitoring
+      - SCRAPE_INTERVAL=60
+      - ANOMALY_CONTAMINATION=0.05
+      - HEARTBEAT_URL=${HEARTBEAT_URL:-}
+    depends_on: [prometheus, postgres]
+
+  remediation:
+    build: ./remediation
+    container_name: remediation
+    networks: [monitoring_net]
+    ports: ["8001:8001"]
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - DATABASE_URL=postgresql://monitor:monitor123@postgres:5432/monitoring
+      - AI_ENGINE_URL=http://ai-engine:8000
+    depends_on: [postgres, ai-engine]
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    networks: [monitoring_net]
+    ports: ["11434:11434"]
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    networks: [monitoring_net]
+    ports: ["5678:5678"]
+    restart: unless-stopped
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin123
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - WEBHOOK_URL=http://localhost:5678/
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=monitoring
+      - DB_POSTGRESDB_USER=monitor
+      - DB_POSTGRESDB_PASSWORD=monitor123
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on: [postgres, ollama]
