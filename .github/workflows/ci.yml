@@ -26,15 +26,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           find . -name requirements.txt -exec pip install -r {} \; || true
-          pip install pytest flake8 || true
+          pip install pytest flake8
 
       - name: Lint Python
         run: |
-          flake8 . --max-line-length=120 || true
+          flake8 . --max-line-length=120
 
       - name: Run tests
         run: |
-          pytest -q || true
+          pytest -q
 
       - name: Check workflow files exist
         run: |
