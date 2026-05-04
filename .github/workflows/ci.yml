@@ -34,7 +34,7 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest -q || true
+          pytest -q || if [ $? -eq 5 ]; then echo "No tests found, skipping."; else exit $?; fi
 
       - name: Check workflow files exist
         run: |
