@@ -1,0 +1,29 @@
+name: Deploy to Monitoring VM
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: self-hosted
+
+    steps:
+      - name: Show runner info
+        run: |
+          whoami
+          hostname
+          pwd
+
+      - name: Update project on VM
+        run: |
+          cd /home/vboxuser/monitoring
+          git checkout main
+          git pull origin main
+          docker compose up -d --build
