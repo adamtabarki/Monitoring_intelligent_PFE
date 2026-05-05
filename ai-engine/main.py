@@ -16,23 +16,23 @@ from models.correlator import correlate, get_open_incidents
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(message)s"
+    format="%(asctime)s [%(name)s] %(message)s",
 )
 log = logging.getLogger("ai-engine")
 
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://monitor:monitor123@postgres:5432/monitoring"
+    "postgresql://monitor:monitor123@postgres:5432/monitoring",
 )
 SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL", 60))
 CONTAMINATION = float(os.getenv("ANOMALY_CONTAMINATION", 0.03))
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
 MONITORED_INSTANCE = os.getenv("MONITORED_INSTANCE", "node-server")
 
-# Medium anomalies triggered only by Isolation Forest are considered weak signals.
-# They must repeat before being accepted.
-IF_ONLY_REPEAT_REQUIRED = int(os.getenv("IF_ONLY_REPEAT_REQUIRED", 2))
+# Prevent training on old Prometheus history after an AI engine restart.
+# The model will use only samples collected after this process started.
+ENGINE_START_TS = time.time()
 
 db_engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -48,7 +48,6 @@ state = {
     "last_alert_ts": 0.0,
     "last_alert_keys": set(),
     "model_loaded_from_disk": model_loaded,
-    "pending_if_only": {},
 }
 
 
@@ -58,7 +57,9 @@ def anomaly_key(anomaly):
         "top_feature": anomaly.get("top_feature"),
         "severity": anomaly.get("severity"),
         "reason": anomaly.get("reason"),
+        "trigger_sources": anomaly.get("trigger_sources", []),
     }
+
     raw = json.dumps(payload, sort_keys=True)
     return hashlib.md5(raw.encode()).hexdigest()
 
@@ -104,15 +105,15 @@ def save_anomaly(instance, anomaly):
                     technical_reason
                 )
                 VALUES (
-                    :inst,
-                    :cpu,
-                    :mem,
-                    :disk_fill,
+                    :instance,
+                    :cpu_pct,
+                    :mem_pct,
+                    :disk_fill_pct,
                     :disk_io,
                     :net_traffic,
                     :http_requests,
                     :score,
-                    :sev,
+                    :severity,
                     'new',
                     :family,
                     :top_feature,
@@ -120,21 +121,22 @@ def save_anomaly(instance, anomaly):
                 )
                 RETURNING id
             """), dict(
-                inst=instance,
-                cpu=features.get("cpu_pct"),
-                mem=features.get("mem_pct"),
-                disk_fill=features.get("disk_fill_pct"),
+                instance=instance,
+                cpu_pct=features.get("cpu_pct"),
+                mem_pct=features.get("mem_pct"),
+                disk_fill_pct=features.get("disk_fill_pct"),
                 disk_io=features.get("disk_io"),
                 net_traffic=features.get("net_traffic"),
                 http_requests=features.get("http_requests"),
                 score=anomaly.get("score"),
-                sev=anomaly.get("severity"),
+                severity=anomaly.get("severity"),
                 family=anomaly.get("family"),
                 top_feature=anomaly.get("top_feature"),
                 technical_reason=technical_reason,
             ))
 
-            return row.fetchone()[0]
+            anomaly_id = row.fetchone()[0]
+            return anomaly_id
 
     except Exception as e:
         log.error(f"DB anomaly write failed: {e}", exc_info=True)
@@ -159,65 +161,70 @@ def heartbeat_loop():
 
 def _dedup_latest(raw_anomalies):
     """
-    Keep only the strongest anomaly per family in the latest timestamp bucket.
-    This reduces noise in the anomaly table and helps correlation.
+    Keep only the strongest anomaly per family for the latest timestamp.
+    This avoids creating many rows for the same incident cycle.
     """
     if not raw_anomalies:
         return []
 
-    latest_ts = max(a["timestamp"] for a in raw_anomalies)
-    latest_only = [a for a in raw_anomalies if a["timestamp"] == latest_ts]
+    latest_ts = max(anomaly["timestamp"] for anomaly in raw_anomalies)
+    latest_only = [
+        anomaly
+        for anomaly in raw_anomalies
+        if anomaly["timestamp"] == latest_ts
+    ]
+
+    severity_rank = {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "critical": 4,
+    }
 
     by_family = {}
-    severity_rank = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
     for anomaly in latest_only:
         family = anomaly.get("family", "unknown")
         current = by_family.get(family)
 
-        current_rank = severity_rank.get(current.get("severity"), 0) if current else 0
-        new_rank = severity_rank.get(anomaly.get("severity"), 0)
-
         if current is None:
             by_family[family] = anomaly
-        elif new_rank > current_rank:
+            continue
+
+        current_rank = severity_rank.get(current.get("severity"), 0)
+        new_rank = severity_rank.get(anomaly.get("severity"), 0)
+
+        if new_rank > current_rank:
             by_family[family] = anomaly
-        elif new_rank == current_rank and anomaly.get("score", 0) < current.get("score", 0):
-            by_family[family] = anomaly
+        elif new_rank == current_rank:
+            if anomaly.get("score", 0) < current.get("score", 0):
+                by_family[family] = anomaly
 
     return list(by_family.values())
 
 
-def _filter_if_only_medium(anomalies):
+def _filter_if_only_anomalies(anomalies):
     """
-    IF-only medium anomalies are weak signals.
-    Keep them only if they repeat for IF_ONLY_REPEAT_REQUIRED cycles.
+    Isolation Forest alone is treated as a weak exploratory signal.
+    In the final system, real incidents require z-score or hard-threshold
+    confirmation. This prevents false CPU/storage incidents from IF-only scores.
     """
     filtered = []
-    new_pending = {}
 
     for anomaly in anomalies:
         sources = set(anomaly.get("trigger_sources", []))
-        key = anomaly_key(anomaly)
 
-        is_if_only_medium = (
-            anomaly.get("severity") == "medium" and
-            sources == {"iforest"}
-        )
-
-        if not is_if_only_medium:
-            filtered.append(anomaly)
+        if sources == {"iforest"}:
+            log.info(
+                "Dropped IF-only anomaly: "
+                f"feature={anomaly.get('top_feature')} "
+                f"family={anomaly.get('family')} "
+                f"score={anomaly.get('score')}"
+            )
             continue
 
-        count = state["pending_if_only"].get(key, 0) + 1
+        filtered.append(anomaly)
 
-        if count >= IF_ONLY_REPEAT_REQUIRED:
-            filtered.append(anomaly)
-            new_pending[key] = 0
-        else:
-            new_pending[key] = count
-
-    state["pending_if_only"] = new_pending
     return filtered
 
 
@@ -226,7 +233,8 @@ def analysis_loop():
         try:
             matrix = fetch_feature_matrix(
                 PROMETHEUS_URL,
-                instance=MONITORED_INSTANCE
+                instance=MONITORED_INSTANCE,
+                min_timestamp=ENGINE_START_TS,
             )
 
             if matrix is None:
@@ -234,11 +242,9 @@ def analysis_loop():
                 time.sleep(SCRAPE_INTERVAL)
                 continue
 
-            X, names, timestamps = (
-                matrix.values,
-                matrix.feature_names,
-                matrix.timestamps
-            )
+            X = matrix.values
+            names = matrix.feature_names
+            timestamps = matrix.timestamps
 
             if not detector.trained:
                 detector.train(X, names)
@@ -250,9 +256,9 @@ def analysis_loop():
 
             raw = detector.predict(X, names, timestamps, matrix.families)
             latest_compact = _dedup_latest(raw)
-            filtered = _filter_if_only_medium(latest_compact)
+            filtered = _filter_if_only_anomalies(latest_compact)
 
-            new = []
+            new_anomalies = []
             new_keys = set()
 
             for anomaly in filtered:
@@ -262,17 +268,19 @@ def analysis_loop():
                     anomaly["timestamp"] > state["last_alert_ts"]
                     or key not in state["last_alert_keys"]
                 ):
-                    new.append(anomaly)
+                    new_anomalies.append(anomaly)
                     new_keys.add(key)
 
             log.info(
                 "Cycle stats | "
-                f"samples={len(X)} raw={len(raw)} "
+                f"samples={len(X)} "
+                f"raw={len(raw)} "
                 f"latest_compact={len(latest_compact)} "
-                f"filtered={len(filtered)} new={len(new)}"
+                f"filtered={len(filtered)} "
+                f"new={len(new_anomalies)}"
             )
 
-            if not new:
+            if not new_anomalies:
                 log.info(f"Normal. {latest_values(matrix)}")
                 state["last_anomalies"] = []
                 state["last_incidents"] = []
@@ -281,17 +289,20 @@ def analysis_loop():
                 time.sleep(SCRAPE_INTERVAL)
                 continue
 
-            state["last_alert_ts"] = max(a["timestamp"] for a in new)
+            state["last_alert_ts"] = max(
+                anomaly["timestamp"]
+                for anomaly in new_anomalies
+            )
             state["last_alert_keys"] = new_keys
 
-            for anomaly in new:
+            for anomaly in new_anomalies:
                 db_id = save_anomaly(matrix.instance, anomaly)
                 anomaly["db_id"] = db_id
                 anomaly["instance"] = matrix.instance
 
-            incidents = correlate(new)
+            incidents = correlate(new_anomalies)
 
-            state["last_anomalies"] = new
+            state["last_anomalies"] = new_anomalies
             state["last_incidents"] = incidents
 
             for incident in incidents:
@@ -311,7 +322,7 @@ def analysis_loop():
         time.sleep(SCRAPE_INTERVAL)
 
 
-app = FastAPI(title="AI Monitoring Engine", version="5.1.0")
+app = FastAPI(title="AI Monitoring Engine", version="5.2.0")
 
 
 @app.on_event("startup")
@@ -319,7 +330,7 @@ def startup():
     wait_for_db()
     Thread(target=heartbeat_loop, daemon=True).start()
     Thread(target=analysis_loop, daemon=True).start()
-    log.info("AI engine v5.1.0 started.")
+    log.info("AI engine v5.2.0 started.")
 
 
 @app.get("/health")
@@ -369,4 +380,5 @@ def status():
         "scrape_interval": SCRAPE_INTERVAL,
         "instance": MONITORED_INSTANCE,
         "model_loaded_from_disk": state["model_loaded_from_disk"],
+        "engine_start_ts": ENGINE_START_TS,
     }

@@ -10,23 +10,47 @@ from sklearn.preprocessing import StandardScaler
 log = logging.getLogger("isolation-forest")
 
 ZSCORE_THRESHOLDS = {
-    "cpu_pct": {"medium": 3.0, "high": 4.0, "critical": 5.0},
-    "mem_pct": {"medium": 4.5, "high": 5.5, "critical": 6.5},
-    "disk_fill_pct": {"medium": 2.5, "high": 3.5, "critical": 4.5},
-    "disk_io": {"medium": 3.5, "high": 4.5, "critical": 5.5},
-    "net_traffic": {"medium": 5.0, "high": 7.0, "critical": 9.0},
-    "http_requests": {"medium": 6.0, "high": 8.0, "critical": 10.0},
+    "cpu_pct": {
+        "medium": 3.0,
+        "high": 4.0,
+        "critical": 5.0,
+    },
+    "mem_pct": {
+        "medium": 4.5,
+        "high": 5.5,
+        "critical": 6.5,
+    },
+    "disk_fill_pct": {
+        "medium": 2.5,
+        "high": 3.5,
+        "critical": 4.5,
+    },
+    "disk_io": {
+        "medium": 4.0,
+        "high": 6.0,
+        "critical": 999.0,
+    },
+    "net_traffic": {
+        "medium": 5.0,
+        "high": 7.0,
+        "critical": 999.0,
+    },
+    "http_requests": {
+        "medium": 6.0,
+        "high": 8.0,
+        "critical": 10.0,
+    },
 }
 
 # Operational hard thresholds.
-# These are the most reliable triggers for strong demo scenarios.
+# These are deterministic guardrails for clear dangerous states.
 HARD_THRESHOLDS = {
     "cpu_pct": 90.0,
     "mem_pct": 90.0,
     "disk_fill_pct": 85.0,
 }
 
-# Minimum std to avoid impossible z-scores on almost constant metrics.
+# Avoid impossible z-score sensitivity on nearly constant metrics.
 MIN_STD_FOR_ZSCORE = {
     "cpu_pct": 0.10,
     "mem_pct": 0.05,
@@ -36,30 +60,41 @@ MIN_STD_FOR_ZSCORE = {
     "http_requests": 0.05,
 }
 
-# Prevent small operational values from creating noisy positive z-score spikes.
-# Example: CPU moving from 2% to 5% can be statistically high but not operationally serious.
+# Positive z-score spikes are ignored if the absolute value is too small.
+# This prevents tiny changes from an idle baseline from becoming incidents.
 ZSCORE_SPIKE_MIN_ABS_VALUE = {
     "cpu_pct": 50.0,
     "mem_pct": 35.0,
     "disk_fill_pct": 70.0,
-    "disk_io": 5000.0,
+    "disk_io": 50000.0,
     "net_traffic": 5000.0,
     "http_requests": 1.0,
 }
 
-# For drops, only alert if the baseline itself was meaningful.
-# This keeps application/HTTP drop detection possible without treating near-zero traffic as critical.
+# Negative drops are useful mainly for HTTP/application behavior.
+# Example: Apache traffic disappears while the baseline expected traffic.
+ZSCORE_DROP_FEATURES = {
+    "http_requests",
+}
+
 ZSCORE_DROP_MIN_BASELINE_MEAN = {
-    "disk_io": 1000.0,
-    "net_traffic": 1000.0,
     "http_requests": 0.02,
 }
 
 NIGHT_HOURS = set(range(0, 6)) | {23}
 SAVE_PATH = Path("/app/persistence/isolation_forest.joblib")
 
-SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
-RANK_SEVERITY = {v: k for k, v in SEVERITY_RANK.items()}
+SEVERITY_RANK = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+
+RANK_SEVERITY = {
+    value: key
+    for key, value in SEVERITY_RANK.items()
+}
 
 
 class IsolationForestDetector:
@@ -113,7 +148,9 @@ class IsolationForestDetector:
 
         anomalies = []
 
-        for row_index, (prediction, score) in enumerate(zip(predictions, scores)):
+        for row_index, (prediction, score) in enumerate(
+            zip(predictions, scores)
+        ):
             features = {
                 name: round(float(X[row_index][feature_index]), 2)
                 for feature_index, name in enumerate(feature_names)
@@ -122,13 +159,13 @@ class IsolationForestDetector:
             reasons = []
             trigger_sources = []
             severity = None
-
             hour = datetime.utcfromtimestamp(timestamps[row_index]).hour
 
+            # Isolation Forest is useful as a supporting signal,
+            # but it does NOT create an incident alone.
             if prediction == -1:
                 reasons.append(f"IF score={round(float(score), 3)}")
                 trigger_sources.append("iforest")
-                severity = _escalate(severity, "medium")
 
             top_abs_z = 0.0
             top_feat_z = None
@@ -137,7 +174,6 @@ class IsolationForestDetector:
 
             for name, value in features.items():
                 baseline = self.baselines.get(name)
-
                 if not baseline:
                     continue
 
@@ -155,15 +191,18 @@ class IsolationForestDetector:
                     top_abs_z = abs_z
                     top_feat_z = name
 
-                thresholds = ZSCORE_THRESHOLDS.get(
-                    name,
-                    ZSCORE_THRESHOLDS["cpu_pct"],
-                )
+                thresholds = ZSCORE_THRESHOLDS.get(name)
+                if not thresholds:
+                    continue
 
+                # Positive spike detection.
                 if z_value >= thresholds["medium"]:
-                    min_value = ZSCORE_SPIKE_MIN_ABS_VALUE.get(name)
+                    min_abs_value = ZSCORE_SPIKE_MIN_ABS_VALUE.get(name)
 
-                    if min_value is not None and value < min_value:
+                    if (
+                        min_abs_value is not None
+                        and value < min_abs_value
+                    ):
                         continue
 
                     if abs_z > z_trigger_abs:
@@ -183,9 +222,12 @@ class IsolationForestDetector:
                         trigger_sources.append("zscore")
                         severity = _escalate(severity, "medium")
 
+                # Negative drop detection.
                 elif z_value <= -thresholds["medium"]:
-                    min_baseline = ZSCORE_DROP_MIN_BASELINE_MEAN.get(name)
+                    if name not in ZSCORE_DROP_FEATURES:
+                        continue
 
+                    min_baseline = ZSCORE_DROP_MIN_BASELINE_MEAN.get(name)
                     if min_baseline is not None and mean < min_baseline:
                         continue
 
@@ -227,17 +269,20 @@ class IsolationForestDetector:
             if not severity:
                 continue
 
+            # Safety rule: IF alone must never create an anomaly.
+            # This also protects against future code changes.
+            if set(trigger_sources) == {"iforest"}:
+                continue
+
             if hour in NIGHT_HOURS:
                 severity = _escalate_one(severity)
                 reasons.append(f"night hour ({hour}:00) escalated")
                 trigger_sources.append("night_escalation")
 
-            dominant_feature = (
-                hard_trigger_feature
-                or z_trigger_feature
-                or top_feat_z
-                or _best_if_only_feature(features)
-            )
+            dominant_feature = hard_trigger_feature or z_trigger_feature
+
+            if not dominant_feature:
+                continue
 
             anomalies.append({
                 "timestamp": timestamps[row_index],
@@ -246,7 +291,7 @@ class IsolationForestDetector:
                 "features": features,
                 "top_feature": dominant_feature,
                 "family": families.get(dominant_feature, "unknown"),
-                "reason": "; ".join(reasons) if reasons else "anomaly detected",
+                "reason": "; ".join(reasons),
                 "trigger_sources": sorted(set(trigger_sources)),
                 "hour": hour,
             })
@@ -292,27 +337,6 @@ class IsolationForestDetector:
         except Exception as e:
             log.warning(f"Load failed: {e} — will retrain.", exc_info=True)
             return False
-
-
-def _best_if_only_feature(features):
-    """
-    Fallback dominant feature for IF-only anomalies.
-    Prefer operationally meaningful metrics rather than arbitrary max().
-    """
-    priority = [
-        "cpu_pct",
-        "disk_io",
-        "net_traffic",
-        "mem_pct",
-        "disk_fill_pct",
-        "http_requests",
-    ]
-
-    for name in priority:
-        if name in features:
-            return name
-
-    return next(iter(features.keys()))
 
 
 def _escalate(current, new):

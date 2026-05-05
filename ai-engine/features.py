@@ -46,8 +46,11 @@ FEATURE_QUERIES = [
     ),
 ]
 
-FEATURE_NAMES = [f[0] for f in FEATURE_QUERIES]
-FEATURE_FAMILIES = {f[0]: f[3] for f in FEATURE_QUERIES}
+FEATURE_NAMES = [feature[0] for feature in FEATURE_QUERIES]
+FEATURE_FAMILIES = {
+    feature[0]: feature[3]
+    for feature in FEATURE_QUERIES
+}
 
 REQUIRED_FEATURES = [
     "cpu_pct",
@@ -93,8 +96,12 @@ def _query_range(prometheus_url, query, lookback=3600, step=60):
             return pd.Series(dtype=float)
 
         values = results[0]["values"]
+
         return pd.Series(
-            {float(timestamp): float(value) for timestamp, value in values},
+            {
+                float(timestamp): float(value)
+                for timestamp, value in values
+            },
             dtype=float,
         )
 
@@ -109,6 +116,7 @@ def fetch_feature_matrix(
     lookback=3600,
     step=60,
     min_samples=30,
+    min_timestamp=None,
 ):
     series = {}
 
@@ -127,16 +135,24 @@ def fetch_feature_matrix(
         log.warning("No Prometheus samples returned for any feature.")
         return None
 
+    if min_timestamp is not None:
+        df = df[df.index >= float(min_timestamp)]
+
+    if df.empty:
+        log.warning("No fresh samples after engine startup.")
+        return None
+
     # Smooth short gaps first.
     df = df.ffill(limit=3).bfill(limit=3)
 
-    # Optional features must not break CPU/memory/disk detection.
+    # Optional metrics must not break CPU/memory/disk-fill detection.
     for feature in OPTIONAL_ZERO_FILL_FEATURES:
         if feature in df.columns:
             df[feature] = df[feature].fillna(0.0)
 
     existing_required = [
-        feature for feature in REQUIRED_FEATURES
+        feature
+        for feature in REQUIRED_FEATURES
         if feature in df.columns
     ]
 
@@ -147,7 +163,7 @@ def fetch_feature_matrix(
     # Only core metrics are mandatory.
     df = df.dropna(subset=existing_required)
 
-    # Any remaining optional gaps become zero.
+    # Remaining optional gaps become zero.
     df = df.fillna(0.0)
 
     if len(df) < min_samples:
