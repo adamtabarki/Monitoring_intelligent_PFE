@@ -11,7 +11,7 @@ engine = create_engine(
         "DATABASE_URL",
         "postgresql://monitor:monitor123@postgres:5432/monitoring"
     ),
-    pool_pre_ping=True
+    pool_pre_ping=True,
 )
 
 ROOT_CAUSES = {
@@ -26,82 +26,141 @@ ROOT_CAUSES = {
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 RANK_SEVERITY = {v: k for k, v in SEVERITY_RANK.items()}
 
+OPEN_STATUSES = (
+    "new",
+    "processing",
+    "alerted",
+    "in_progress",
+    "manual_required",
+)
+
 
 def correlate(anomalies):
     if not anomalies:
         return []
 
     groups = {}
-    for a in anomalies:
-        groups.setdefault(a.get("family", "unknown"), []).append(a)
+
+    for anomaly in anomalies:
+        family = anomaly.get("family", "unknown")
+        groups.setdefault(family, []).append(anomaly)
 
     incidents = []
 
     for family, group in groups.items():
-        worst = max(SEVERITY_RANK.get(a.get("severity", "low"), 1) for a in group)
-        severity = RANK_SEVERITY.get(worst, "low")
-        root = ROOT_CAUSES.get(family, f"Anomaly in {family}")
+        worst_rank = max(
+            SEVERITY_RANK.get(anomaly.get("severity", "low"), 1)
+            for anomaly in group
+        )
 
-        seen, reasons = set(), []
-        for a in group:
-            r = a.get("reason", "")
-            if r and r not in seen:
-                seen.add(r)
-                reasons.append(r)
+        severity = RANK_SEVERITY.get(worst_rank, "low")
+        root_cause = ROOT_CAUSES.get(family, f"Anomaly in {family}")
 
-        reason = " | ".join(reasons[:3])
-        title = f"[{severity.upper()}] {root} — {len(group)} signal(s)"
+        seen_reasons = set()
+        reasons = []
+
+        for anomaly in group:
+            reason = anomaly.get("reason", "")
+
+            if reason and reason not in seen_reasons:
+                seen_reasons.add(reason)
+                reasons.append(reason)
+
+        technical_reason = " | ".join(reasons[:3])
+        title = f"[{severity.upper()}] {root_cause} — {len(group)} signal(s)"
 
         try:
-            inc_id = _find_matching_open_incident(root, severity)
-            if not inc_id:
-                inc_id = _save(title, severity, root, reason)
+            open_incident = _find_matching_open_incident(root_cause)
 
-            _link_anomalies(inc_id, group)
+            if open_incident:
+                incident_id = open_incident["id"]
+
+                _update_incident_if_needed(
+                    incident_id=incident_id,
+                    current_severity=open_incident["severity"],
+                    new_severity=severity,
+                    title=title,
+                    technical_reason=technical_reason,
+                )
+            else:
+                incident_id = _save(
+                    title=title,
+                    severity=severity,
+                    root_cause=root_cause,
+                    technical_reason=technical_reason,
+                )
+
+            if not incident_id:
+                log.warning(
+                    f"Skipping correlation for family={family}; "
+                    "incident id is missing."
+                )
+                continue
+
+            _link_anomalies(incident_id, group)
 
             incidents.append({
-                "incident_id": inc_id,
+                "incident_id": incident_id,
                 "title": title,
                 "severity": severity,
-                "root_cause": root,
-                "reason": reason,
+                "root_cause": root_cause,
+                "reason": technical_reason,
                 "anomaly_count": len(group),
                 "family": family,
                 "created_at": datetime.utcnow().isoformat(),
             })
 
             log.warning(
-                f"INCIDENT [{severity.upper()}] {root} — {len(group)} anomaly(ies)"
+                f"INCIDENT [{severity.upper()}] "
+                f"{root_cause} — {len(group)} anomaly(ies)"
             )
 
         except Exception as e:
-            log.error(f"Correlate group failed for family={family}: {e}", exc_info=True)
+            log.error(
+                f"Correlate group failed for family={family}: {e}",
+                exc_info=True,
+            )
 
     return incidents
 
 
-def _find_matching_open_incident(root_cause, severity):
+def _find_matching_open_incident(root_cause):
+    """
+    Reuse a recent open incident with the same root cause.
+    Severity is not required to match, because an incident may escalate.
+    """
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT id
+                SELECT id, severity
                 FROM incidents
-                WHERE root_cause = :r
-                  AND severity = :s
-                  AND status IN ('new', 'processing', 'alerted', 'in_progress', 'manual_required')
+                WHERE root_cause = :root_cause
+                  AND status IN (
+                      'new',
+                      'processing',
+                      'alerted',
+                      'in_progress',
+                      'manual_required'
+                  )
                   AND created_at >= NOW() - INTERVAL '10 minutes'
                 ORDER BY created_at DESC
                 LIMIT 1
-            """), dict(r=root_cause, s=severity)).fetchone()
+            """), dict(root_cause=root_cause)).fetchone()
 
-            return row[0] if row else None
+            if not row:
+                return None
+
+            return {
+                "id": row[0],
+                "severity": row[1],
+            }
 
     except Exception as e:
         log.error(f"Find open incident failed: {e}", exc_info=True)
         return None
 
 
-def _save(title, severity, root_cause, reason):
+def _save(title, severity, root_cause, technical_reason):
     try:
         with engine.begin() as conn:
             row = conn.execute(text("""
@@ -112,37 +171,87 @@ def _save(title, severity, root_cause, reason):
                     technical_reason,
                     status
                 )
-                VALUES (:t, :s, :r, :tr, 'new')
+                VALUES (:title, :severity, :root_cause, :technical_reason, 'new')
                 RETURNING id
             """), dict(
-                t=title,
-                s=severity,
-                r=root_cause,
-                tr=reason
+                title=title,
+                severity=severity,
+                root_cause=root_cause,
+                technical_reason=technical_reason,
             ))
-            inc_id = row.fetchone()[0]
-            log.info(f"Created incident id={inc_id} title={title}")
-            return inc_id
+
+            incident_id = row.fetchone()[0]
+
+            log.info(f"Created incident id={incident_id} title={title}")
+            return incident_id
 
     except Exception as e:
         log.error(f"Save incident failed: {e}", exc_info=True)
         return None
 
 
-def _link_anomalies(inc_id, anomalies):
-    if not inc_id:
+def _update_incident_if_needed(
+    incident_id,
+    current_severity,
+    new_severity,
+    title,
+    technical_reason,
+):
+    """
+    Escalate an existing open incident if a stronger severity is detected.
+    This avoids duplicate incidents for the same ongoing root cause.
+    """
+    current_rank = SEVERITY_RANK.get(current_severity, 1)
+    new_rank = SEVERITY_RANK.get(new_severity, 1)
+
+    if new_rank <= current_rank:
+        return
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE incidents
+                SET severity = :severity,
+                    title = :title,
+                    technical_reason = :technical_reason
+                WHERE id = :id
+            """), dict(
+                id=incident_id,
+                severity=new_severity,
+                title=title,
+                technical_reason=technical_reason,
+            ))
+
+        log.info(
+            f"Escalated incident id={incident_id} "
+            f"from {current_severity} to {new_severity}"
+        )
+
+    except Exception as e:
+        log.error(f"Update incident failed: {e}", exc_info=True)
+
+
+def _link_anomalies(incident_id, anomalies):
+    if not incident_id:
         log.warning("Skipping anomaly linking because incident id is missing.")
         return
 
     try:
         with engine.begin() as conn:
-            for a in anomalies:
-                if a.get("db_id"):
-                    conn.execute(text("""
-                        INSERT INTO incident_anomalies (incident_id, anomaly_id)
-                        VALUES (:i, :a)
-                        ON CONFLICT DO NOTHING
-                    """), dict(i=inc_id, a=a["db_id"]))
+            for anomaly in anomalies:
+                anomaly_id = anomaly.get("db_id")
+
+                if not anomaly_id:
+                    continue
+
+                conn.execute(text("""
+                    INSERT INTO incident_anomalies (incident_id, anomaly_id)
+                    VALUES (:incident_id, :anomaly_id)
+                    ON CONFLICT DO NOTHING
+                """), dict(
+                    incident_id=incident_id,
+                    anomaly_id=anomaly_id,
+                ))
 
     except Exception as e:
         log.error(f"Link anomalies failed: {e}", exc_info=True)
@@ -162,41 +271,31 @@ def get_open_incidents():
                     status,
                     created_at
                 FROM incidents
-                WHERE status IN ('new', 'processing', 'alerted', 'in_progress', 'manual_required')
+                WHERE status IN (
+                    'new',
+                    'processing',
+                    'alerted',
+                    'in_progress',
+                    'manual_required'
+                )
                 ORDER BY created_at DESC
                 LIMIT 20
             """)).fetchall()
 
             return [
                 dict(
-                    incident_id=r[0],
-                    title=r[1],
-                    severity=r[2],
-                    root_cause=r[3],
-                    technical_reason=r[4],
-                    llm_summary=r[5],
-                    status=r[6],
-                    created_at=r[7].isoformat() if r[7] else None
+                    incident_id=row[0],
+                    title=row[1],
+                    severity=row[2],
+                    root_cause=row[3],
+                    technical_reason=row[4],
+                    llm_summary=row[5],
+                    status=row[6],
+                    created_at=row[7].isoformat() if row[7] else None,
                 )
-                for r in rows
+                for row in rows
             ]
 
     except Exception as e:
         log.error(f"Fetch incidents failed: {e}", exc_info=True)
         return []
-
-
-def resolve_incident(incident_id, note=""):
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE incidents
-                SET status = 'resolved',
-                    resolved_at = NOW()
-                WHERE id = :id
-            """), dict(id=incident_id))
-
-        log.info(f"Incident {incident_id} resolved. note={note}")
-
-    except Exception as e:
-        log.error(f"Resolve failed: {e}", exc_info=True)

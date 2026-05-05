@@ -49,6 +49,18 @@ FEATURE_QUERIES = [
 FEATURE_NAMES = [f[0] for f in FEATURE_QUERIES]
 FEATURE_FAMILIES = {f[0]: f[3] for f in FEATURE_QUERIES}
 
+REQUIRED_FEATURES = [
+    "cpu_pct",
+    "mem_pct",
+    "disk_fill_pct",
+]
+
+OPTIONAL_ZERO_FILL_FEATURES = [
+    "disk_io",
+    "net_traffic",
+    "http_requests",
+]
+
 
 @dataclass
 class FeatureMatrix:
@@ -64,7 +76,7 @@ def _query_range(prometheus_url, query, lookback=3600, step=60):
     start = end - lookback
 
     try:
-        r = requests.get(
+        response = requests.get(
             f"{prometheus_url}/api/v1/query_range",
             params={
                 "query": query,
@@ -74,14 +86,17 @@ def _query_range(prometheus_url, query, lookback=3600, step=60):
             },
             timeout=10,
         )
-        r.raise_for_status()
+        response.raise_for_status()
 
-        results = r.json()["data"]["result"]
+        results = response.json()["data"]["result"]
         if not results:
             return pd.Series(dtype=float)
 
-        vals = results[0]["values"]
-        return pd.Series({float(ts): float(v) for ts, v in vals}, dtype=float)
+        values = results[0]["values"]
+        return pd.Series(
+            {float(timestamp): float(value) for timestamp, value in values},
+            dtype=float,
+        )
 
     except Exception as e:
         log.warning(f"Query failed [{query[:120]}]: {e}")
@@ -99,16 +114,41 @@ def fetch_feature_matrix(
 
     for name, query, _, _ in FEATURE_QUERIES:
         formatted_query = query.format(instance=instance)
-        s = _query_range(prometheus_url, formatted_query, lookback, step)
-        series[name] = s
+        series[name] = _query_range(
+            prometheus_url,
+            formatted_query,
+            lookback=lookback,
+            step=step,
+        )
 
     df = pd.DataFrame(series).sort_index()
+
+    if df.empty:
+        log.warning("No Prometheus samples returned for any feature.")
+        return None
+
+    # Smooth short gaps first.
     df = df.ffill(limit=3).bfill(limit=3)
 
-    if "http_requests" in df.columns:
-        df["http_requests"] = df["http_requests"].fillna(0.0)
+    # Optional features must not break CPU/memory/disk detection.
+    for feature in OPTIONAL_ZERO_FILL_FEATURES:
+        if feature in df.columns:
+            df[feature] = df[feature].fillna(0.0)
 
-    df = df.dropna()
+    existing_required = [
+        feature for feature in REQUIRED_FEATURES
+        if feature in df.columns
+    ]
+
+    if not existing_required:
+        log.warning("No required core metrics found.")
+        return None
+
+    # Only core metrics are mandatory.
+    df = df.dropna(subset=existing_required)
+
+    # Any remaining optional gaps become zero.
+    df = df.fillna(0.0)
 
     if len(df) < min_samples:
         log.warning(f"Only {len(df)} samples — need {min_samples}.")
@@ -128,7 +168,8 @@ def latest_values(matrix):
         return {}
 
     latest = matrix.values[-1]
+
     return {
-        name: round(float(val), 2)
-        for name, val in zip(matrix.feature_names, latest)
+        name: round(float(value), 2)
+        for name, value in zip(matrix.feature_names, latest)
     }

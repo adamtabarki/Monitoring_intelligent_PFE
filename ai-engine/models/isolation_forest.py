@@ -18,17 +18,15 @@ ZSCORE_THRESHOLDS = {
     "http_requests": {"medium": 6.0, "high": 8.0, "critical": 10.0},
 }
 
+# Operational hard thresholds.
+# These are the most reliable triggers for strong demo scenarios.
 HARD_THRESHOLDS = {
     "cpu_pct": 90.0,
     "mem_pct": 90.0,
     "disk_fill_pct": 85.0,
 }
 
-NOISY_FEATURE_MIN_ABS = {
-    "net_traffic": 5000.0,
-    "http_requests": 1.0,
-}
-
+# Minimum std to avoid impossible z-scores on almost constant metrics.
 MIN_STD_FOR_ZSCORE = {
     "cpu_pct": 0.10,
     "mem_pct": 0.05,
@@ -36,6 +34,25 @@ MIN_STD_FOR_ZSCORE = {
     "disk_io": 100.0,
     "net_traffic": 20.0,
     "http_requests": 0.05,
+}
+
+# Prevent small operational values from creating noisy positive z-score spikes.
+# Example: CPU moving from 2% to 5% can be statistically high but not operationally serious.
+ZSCORE_SPIKE_MIN_ABS_VALUE = {
+    "cpu_pct": 50.0,
+    "mem_pct": 35.0,
+    "disk_fill_pct": 70.0,
+    "disk_io": 5000.0,
+    "net_traffic": 5000.0,
+    "http_requests": 1.0,
+}
+
+# For drops, only alert if the baseline itself was meaningful.
+# This keeps application/HTTP drop detection possible without treating near-zero traffic as critical.
+ZSCORE_DROP_MIN_BASELINE_MEAN = {
+    "disk_io": 1000.0,
+    "net_traffic": 1000.0,
+    "http_requests": 0.02,
 }
 
 NIGHT_HOURS = set(range(0, 6)) | {23}
@@ -61,56 +78,66 @@ class IsolationForestDetector:
         self.saved_at = None
 
     def train(self, X, feature_names):
-        Xs = self.scaler.fit_transform(X)
-        self.model.fit(Xs)
+        transformed = self.scaler.fit_transform(X)
+        self.model.fit(transformed)
+
         self.trained = True
         self.feature_names = list(feature_names)
         self.saved_at = datetime.utcnow().isoformat()
 
-        for i, name in enumerate(feature_names):
-            col = X[:, i]
+        for index, name in enumerate(feature_names):
+            column = X[:, index]
             self.baselines[name] = {
-                "mean": float(np.mean(col)),
-                "std": float(np.std(col)),
+                "mean": float(np.mean(column)),
+                "std": float(np.std(column)),
             }
 
+        short_baselines = {
+            key: round(value["mean"], 2)
+            for key, value in self.baselines.items()
+        }
+
         log.info(
-            f'Trained on {len(X)} samples. Baselines: '
-            f'{ {k: round(v["mean"], 2) for k, v in self.baselines.items()} }'
+            f"Trained on {len(X)} samples. Baselines: {short_baselines}"
         )
+
         self.save()
 
     def predict(self, X, feature_names, timestamps, families):
         if not self.trained:
             return []
 
-        Xs = self.scaler.transform(X)
-        preds = self.model.predict(Xs)
-        scores = self.model.score_samples(Xs)
+        transformed = self.scaler.transform(X)
+        predictions = self.model.predict(transformed)
+        scores = self.model.score_samples(transformed)
 
         anomalies = []
 
-        for i, (pred, score) in enumerate(zip(preds, scores)):
+        for row_index, (prediction, score) in enumerate(zip(predictions, scores)):
             features = {
-                name: round(float(X[i][j]), 2)
-                for j, name in enumerate(feature_names)
+                name: round(float(X[row_index][feature_index]), 2)
+                for feature_index, name in enumerate(feature_names)
             }
 
             reasons = []
             trigger_sources = []
             severity = None
-            hour = datetime.utcfromtimestamp(timestamps[i]).hour
 
-            if pred == -1:
-                reasons.append(f'IF score={round(float(score), 3)}')
+            hour = datetime.utcfromtimestamp(timestamps[row_index]).hour
+
+            if prediction == -1:
+                reasons.append(f"IF score={round(float(score), 3)}")
                 trigger_sources.append("iforest")
                 severity = _escalate(severity, "medium")
 
             top_abs_z = 0.0
             top_feat_z = None
+            z_trigger_feature = None
+            z_trigger_abs = 0.0
 
-            for name, val in features.items():
+            for name, value in features.items():
                 baseline = self.baselines.get(name)
+
                 if not baseline:
                     continue
 
@@ -121,54 +148,80 @@ class IsolationForestDetector:
                 if std < min_std:
                     continue
 
-                z = (val - mean) / std
-                abs_z = abs(z)
-
-                min_abs = NOISY_FEATURE_MIN_ABS.get(name)
-                if min_abs is not None and abs(val) < min_abs:
-                    continue
+                z_value = (value - mean) / std
+                abs_z = abs(z_value)
 
                 if abs_z > top_abs_z:
                     top_abs_z = abs_z
                     top_feat_z = name
 
-                th = ZSCORE_THRESHOLDS.get(name, ZSCORE_THRESHOLDS["cpu_pct"])
+                thresholds = ZSCORE_THRESHOLDS.get(
+                    name,
+                    ZSCORE_THRESHOLDS["cpu_pct"],
+                )
 
-                if z >= th["critical"]:
-                    reasons.append(f"{name} z={round(z, 1)} spike")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "critical")
-                elif z >= th["high"]:
-                    reasons.append(f"{name} z={round(z, 1)} spike")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "high")
-                elif z >= th["medium"]:
-                    reasons.append(f"{name} z={round(z, 1)} spike")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "medium")
-                elif z <= -th["critical"]:
-                    reasons.append(f"{name} z={round(z, 1)} drop")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "critical")
-                elif z <= -th["high"]:
-                    reasons.append(f"{name} z={round(z, 1)} drop")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "high")
-                elif z <= -th["medium"]:
-                    reasons.append(f"{name} z={round(z, 1)} drop")
-                    trigger_sources.append("zscore")
-                    severity = _escalate(severity, "medium")
+                if z_value >= thresholds["medium"]:
+                    min_value = ZSCORE_SPIKE_MIN_ABS_VALUE.get(name)
+
+                    if min_value is not None and value < min_value:
+                        continue
+
+                    if abs_z > z_trigger_abs:
+                        z_trigger_abs = abs_z
+                        z_trigger_feature = name
+
+                    if z_value >= thresholds["critical"]:
+                        reasons.append(f"{name} z={round(z_value, 1)} spike")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "critical")
+                    elif z_value >= thresholds["high"]:
+                        reasons.append(f"{name} z={round(z_value, 1)} spike")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "high")
+                    else:
+                        reasons.append(f"{name} z={round(z_value, 1)} spike")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "medium")
+
+                elif z_value <= -thresholds["medium"]:
+                    min_baseline = ZSCORE_DROP_MIN_BASELINE_MEAN.get(name)
+
+                    if min_baseline is not None and mean < min_baseline:
+                        continue
+
+                    if abs_z > z_trigger_abs:
+                        z_trigger_abs = abs_z
+                        z_trigger_feature = name
+
+                    if z_value <= -thresholds["critical"]:
+                        reasons.append(f"{name} z={round(z_value, 1)} drop")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "critical")
+                    elif z_value <= -thresholds["high"]:
+                        reasons.append(f"{name} z={round(z_value, 1)} drop")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "high")
+                    else:
+                        reasons.append(f"{name} z={round(z_value, 1)} drop")
+                        trigger_sources.append("zscore")
+                        severity = _escalate(severity, "medium")
 
             hard_trigger_feature = None
+
             for name, threshold in HARD_THRESHOLDS.items():
-                val = features.get(name, 0)
-                if val >= threshold:
-                    reasons.append(f"{name}={val}% >= {threshold}%")
+                value = features.get(name, 0.0)
+
+                if value >= threshold:
+                    reasons.append(f"{name}={value}% >= {threshold}%")
                     trigger_sources.append("hard_threshold")
-                    severity = _escalate(
-                        severity,
-                        "high" if name == "disk_fill_pct" else "critical"
+
+                    hard_severity = (
+                        "high"
+                        if name == "disk_fill_pct"
+                        else "critical"
                     )
+
+                    severity = _escalate(severity, hard_severity)
                     hard_trigger_feature = name
 
             if not severity:
@@ -179,15 +232,20 @@ class IsolationForestDetector:
                 reasons.append(f"night hour ({hour}:00) escalated")
                 trigger_sources.append("night_escalation")
 
-            dominant = hard_trigger_feature or top_feat_z or _best_if_only_feature(features)
+            dominant_feature = (
+                hard_trigger_feature
+                or z_trigger_feature
+                or top_feat_z
+                or _best_if_only_feature(features)
+            )
 
             anomalies.append({
-                "timestamp": timestamps[i],
+                "timestamp": timestamps[row_index],
                 "score": round(float(score), 4),
                 "severity": severity,
                 "features": features,
-                "top_feature": dominant,
-                "family": families.get(dominant, "unknown"),
+                "top_feature": dominant_feature,
+                "family": families.get(dominant_feature, "unknown"),
                 "reason": "; ".join(reasons) if reasons else "anomaly detected",
                 "trigger_sources": sorted(set(trigger_sources)),
                 "hour": hour,
@@ -209,8 +267,9 @@ class IsolationForestDetector:
                 SAVE_PATH,
             )
             log.info(f"Model saved to {SAVE_PATH}")
+
         except Exception as e:
-            log.error(f"Save failed: {e}")
+            log.error(f"Save failed: {e}", exc_info=True)
 
     def load(self):
         if not SAVE_PATH.exists():
@@ -219,16 +278,19 @@ class IsolationForestDetector:
 
         try:
             data = joblib.load(SAVE_PATH)
+
             self.model = data["model"]
             self.scaler = data["scaler"]
             self.baselines = data["baselines"]
             self.feature_names = data.get("feature_names", [])
             self.saved_at = data.get("saved_at")
             self.trained = True
+
             log.info("Model loaded from disk — skipping retraining.")
             return True
+
         except Exception as e:
-            log.warning(f"Load failed: {e} — will retrain.")
+            log.warning(f"Load failed: {e} — will retrain.", exc_info=True)
             return False
 
 
@@ -237,17 +299,31 @@ def _best_if_only_feature(features):
     Fallback dominant feature for IF-only anomalies.
     Prefer operationally meaningful metrics rather than arbitrary max().
     """
-    priority = ["cpu_pct", "disk_io", "net_traffic", "mem_pct", "disk_fill_pct", "http_requests"]
+    priority = [
+        "cpu_pct",
+        "disk_io",
+        "net_traffic",
+        "mem_pct",
+        "disk_fill_pct",
+        "http_requests",
+    ]
+
     for name in priority:
         if name in features:
             return name
+
     return next(iter(features.keys()))
 
 
 def _escalate(current, new):
     if current is None:
         return new
-    return new if SEVERITY_RANK[new] > SEVERITY_RANK[current] else current
+
+    return (
+        new
+        if SEVERITY_RANK[new] > SEVERITY_RANK[current]
+        else current
+    )
 
 
 def _escalate_one(severity):
