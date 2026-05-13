@@ -1,23 +1,51 @@
-# Python
+# ========================
+# Python & ML
+# ========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .venv/
 venv/
+env/
 
-# Environment
+# ========================
+# Project Data & AI State
+# ========================
+# Do not upload local trained models or data artifacts
+ai-engine/persistence/
+persistence/
+*.csv
+*.json
+!docker-compose.yml  # Keep the compose file even if it's yaml/json
+
+# ========================
+# Secrets & Environments
+# ========================
 .env
-.env.*
+.env.dev
+.env.prod
+.env.local
+# Explicitly ALLOW the example file to be pushed
+!.env.example
 
+# Blanket ban on accidentally copied private keys
+*.pem
+*.key
+id_rsa
+id_ed25519
+remediation_ed25519
+
+# ========================
 # Logs
+# ========================
 *.log
 
-# OS / editor
+# ========================
+# OS / Editor / Temp
+# ========================
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-
-# Docker / temp
 *.tmp

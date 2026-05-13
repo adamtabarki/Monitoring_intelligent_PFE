@@ -2,7 +2,6 @@ import os
 import logging
 import subprocess
 import requests
-import shlex
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -70,19 +69,6 @@ def log_action(
         log.error(f"Failed to log action: {e}")
 
 
-def mark_incident_resolved(incident_id: int, note: str):
-    try:
-        with db_engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE incidents
-                SET status      = 'resolved',
-                    resolved_at = NOW(),
-                    llm_summary = COALESCE(:note || ' | ' || llm_summary, :note)
-                WHERE id = :id
-            """), {"id": incident_id, "note": note})
-        log.info(f"Incident {incident_id} marked resolved.")
-    except Exception as e:
-        log.error(f"Failed to resolve incident: {e}")
 
 
 # ── SSH helper ────────────────────────────────────────
@@ -265,8 +251,6 @@ def auto_remediate():
             incident_id=inc_id,
         )
 
-        if success and inc_id:
-            mark_incident_resolved(inc_id, f"Auto-remediated: {action} {target}".strip())
 
         actions_taken.append({
             "incident_id": inc_id,

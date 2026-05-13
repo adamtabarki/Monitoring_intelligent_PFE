@@ -1,41 +1,69 @@
-version: "3.9"
-
 networks:
-  monitoring_net:
+
+  # User-facing layer — dashboards, workflows, public webhook tunnel
+  # grafana and n8n live here. ngrok exposes n8n to the internet.
+  frontend_net:
+    driver: bridge
+
+  # Internal logic layer — metrics collection, AI detection, remediation
+  # Never exposed to the user-facing layer directly.
+  backend_net:
+    driver: bridge
+
+  # Database layer — isolated, only reachable by services that explicitly need it
+  # Postgres is the only service that lives solely here.
+  # Services that need DB access are connected to both their primary net + data_net.
+  data_net:
     driver: bridge
 
 volumes:
   prometheus_data:
   grafana_data:
   postgres_data:
-  ollama_data:
   n8n_data:
 
 services:
 
-  watchdog:
-    image: alpine:latest
-    container_name: watchdog
-    networks: [monitoring_net]
+  # ─────────────────────────────────────────────────────────────────────────────
+  # DATABASE
+  # Networks: data_net only — no other service can reach it unless explicitly
+  # connected to data_net. This isolates the database from the frontend entirely.
+  # ─────────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    networks:
+      - data_net
+    ports:
+      - "5432:5432"
     restart: unless-stopped
     environment:
-      - HEARTBEAT_URL=${HEARTBEAT_URL:-https://example.com}
-    command: >
-      sh -c "
-        echo 'Watchdog started.';
-        while true; do
-          wget -q --spider \"$$HEARTBEAT_URL\";
-          if [ $$? -eq 0 ]; then echo '[watchdog] OK';
-          else echo '[watchdog] ping failed'; fi;
-          sleep 60;
-        done
-      "
+      POSTGRES_DB: monitoring
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitoring"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PROMETHEUS
+  # Networks: backend_net only — scrapes targets, feeds ai-engine.
+  # Has no reason to reach grafana or n8n directly.
+  # Grafana pulls from Prometheus via backend_net (grafana is on both nets).
+  # ─────────────────────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
-    networks: [monitoring_net]
-    ports: ["9090:9090"]
+    networks:
+      - backend_net
+    ports:
+      - "9090:9090"
     restart: unless-stopped
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
@@ -43,127 +71,164 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=15d"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    networks: [monitoring_net]
-    ports: ["3000:3000"]
-    restart: unless-stopped
-    volumes:
-      - grafana_data:/var/lib/grafana
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
-      - GF_USERS_ALLOW_SIGN_UP=false
-    depends_on: [prometheus]
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: postgres
-    networks: [monitoring_net]
-    ports: ["5432:5432"]
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: monitoring
-      POSTGRES_USER: monitor
-      POSTGRES_PASSWORD: monitor123
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
-
+  # ─────────────────────────────────────────────────────────────────────────────
+  # AI ENGINE
+  # Networks: backend_net (talks to Prometheus) + data_net (writes to Postgres)
+  # Cannot reach grafana or n8n — no reason to.
+  # ─────────────────────────────────────────────────────────────────────────────
   ai-engine:
     build: ./ai-engine
     container_name: ai-engine
-    networks: [monitoring_net]
-    ports: ["8000:8000"]
+    networks:
+      - backend_net
+      - data_net
+    ports:
+      - "8000:8000"
     restart: unless-stopped
     volumes:
       - ./ai-engine/persistence:/app/persistence
     environment:
       - PROMETHEUS_URL=http://prometheus:9090
-      - DATABASE_URL=postgresql://monitor:monitor123@postgres:5432/monitoring
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/monitoring
       - SCRAPE_INTERVAL=60
       - ANOMALY_CONTAMINATION=0.05
-      - HEARTBEAT_URL=${HEARTBEAT_URL:-}
-    depends_on: [prometheus, postgres]
+      - MONITORED_INSTANCE=node-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # REMEDIATION
+  # Networks: backend_net (talks to ai-engine) + data_net (reads/writes Postgres)
+  # SSHes into node-server-1 directly via host-only network — no Docker network needed.
+  # Cannot reach frontend (grafana, n8n) — no reason to.
+  # ─────────────────────────────────────────────────────────────────────────────
   remediation:
     build: ./remediation
     container_name: remediation
-    networks: [monitoring_net]
-    ports: ["8001:8001"]
+    networks:
+      - backend_net
+      - data_net
+    ports:
+      - "8001:8001"
     restart: unless-stopped
     volumes:
       - /home/vboxuser/.ssh/remediation_ed25519:/app/keys/remediation_ed25519:ro
     environment:
-      - DATABASE_URL=postgresql://monitor:monitor123@postgres:5432/monitoring
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/monitoring
       - AI_ENGINE_URL=http://ai-engine:8000
-      - SSH_HOST=192.168.56.11
-      - SSH_USER=remediator
+      - SSH_HOST=${SSH_HOST}
+      - SSH_USER=${SSH_USER}
       - SSH_PORT=22
       - SSH_KEY_PATH=/app/keys/remediation_ed25519
-    depends_on: [postgres, ai-engine]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-engine:
+        condition: service_started
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    networks: [monitoring_net]
-    ports: ["11434:11434"]
+  # ─────────────────────────────────────────────────────────────────────────────
+  # GRAFANA
+  # Networks: frontend_net (user-facing) + backend_net (pulls from Prometheus)
+  #           + data_net (stores dashboards in Postgres backend)
+  # Grafana needs all three networks because it touches all layers.
+  # Uses Postgres as its backend database — dashboards survive container restarts.
+  # ─────────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks:
+      - frontend_net
+      - backend_net
+      - data_net
+    ports:
+      - "3000:3000"
     restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
-      - ollama_data:/root/.ollama
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # N8N
+  # Networks: frontend_net (user-facing webhook receiver) + data_net (Postgres state)
+  # Does NOT need backend_net — n8n calls ai-engine via HTTP on the host network
+  # through the published port 8000, not through Docker DNS.
+  # Ollama runs on Windows host at 192.168.56.1:11434 — no Docker network needed.
+  # ─────────────────────────────────────────────────────────────────────────────
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
-    networks: [monitoring_net]
-    ports: ["5678:5678"]
+    networks:
+      - frontend_net
+      - data_net
+    ports:
+      - "5678:5678"
     restart: unless-stopped
     environment:
       - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=admin
-      - N8N_BASIC_AUTH_PASSWORD=admin123
-      - N8N_HOST=machinist-trailside-stuffing.ngrok-free.dev
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_HOST=${EXTERNAL_DOMAIN}
       - N8N_PORT=5678
       - N8N_PROTOCOL=https
-      - WEBHOOK_URL=https://machinist-trailside-stuffing.ngrok-free.dev
+      - WEBHOOK_URL=https://${EXTERNAL_DOMAIN}
       - DB_TYPE=postgresdb
       - DB_POSTGRESDB_HOST=postgres
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_DATABASE=n8n
-      - DB_POSTGRESDB_USER=monitor
-      - DB_POSTGRESDB_PASSWORD=monitor123
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - n8n_data:/home/node/.n8n
-    depends_on: [postgres, ollama]
-    
-  openclaw:
-    image: ghcr.io/openclaw/openclaw:latest
-    container_name: openclaw
-    networks: [monitoring_net]
-    ports: ["18789:18789"]
-    restart: unless-stopped
-    volumes:
-      - /home/vboxuser/.openclaw:/home/node/.openclaw
-      
-  openclaw-cli:
-    image: ghcr.io/openclaw/openclaw:latest
-    container_name: openclaw-cli
-    network_mode: "service:openclaw"
-    restart: "no"
-    volumes:
-      - /home/vboxuser/.openclaw:/home/node/.openclaw
-    entrypoint: ["node", "dist/index.js"]
-  openclaw-bridge:
-    image: alpine:3.20
-    container_name: openclaw-bridge
-    network_mode: "service:openclaw"
     depends_on:
-      - openclaw
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # NGROK
+  # Networks: frontend_net only — tunnels n8n webhook to the public internet.
+  # Only needs to reach n8n which is on frontend_net.
+  # ─────────────────────────────────────────────────────────────────────────────
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: ngrok
+    networks:
+      - frontend_net
+    command:
+      - "http"
+      - "--url=${EXTERNAL_DOMAIN}"
+      - "http://n8n:5678"
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     restart: unless-stopped
-    command: >
-      sh -c "apk add --no-cache socat &&
-             socat TCP-LISTEN:18790,bind=0.0.0.0,fork,reuseaddr TCP:127.0.0.1:18789"
-             
-             
-            
+    depends_on:
+      n8n:
+        condition: service_healthy

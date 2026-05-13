@@ -1,5 +1,7 @@
 CREATE DATABASE n8n;
 
+\c n8n; -- Connects to the database before creating tables (good practice)
+
 CREATE TABLE IF NOT EXISTS anomalies (
     id              SERIAL PRIMARY KEY,
     detected_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -29,11 +31,17 @@ CREATE TABLE IF NOT EXISTS incidents (
     title             VARCHAR(255) NOT NULL,
     severity          VARCHAR(20) NOT NULL DEFAULT 'low',
     root_cause        VARCHAR(255),
+    confidence        INTEGER DEFAULT 50,
     technical_reason  TEXT,
     llm_summary       TEXT,
 
     status            VARCHAR(20) NOT NULL DEFAULT 'new',
-    whatsapp_sent     BOOLEAN NOT NULL DEFAULT FALSE
+    whatsapp_sent     BOOLEAN NOT NULL DEFAULT FALSE,
+    
+    -- Jira Tracking Fields
+    jira_issue_key    VARCHAR(50),
+    jira_issue_id     VARCHAR(50),
+    jira_status       VARCHAR(50)
 );
 
 CREATE TABLE IF NOT EXISTS incident_anomalies (
@@ -53,7 +61,7 @@ CREATE TABLE IF NOT EXISTS remediation_actions (
     success       BOOLEAN DEFAULT TRUE
 );
 
-CREATE INDEX IF NOT EXISTS idx_anomalies_detected     ON anomalies (detected_at DESC);
-CREATE INDEX IF NOT EXISTS idx_anomalies_status       ON anomalies (status);
-CREATE INDEX IF NOT EXISTS idx_incidents_status       ON incidents (status);
-CREATE INDEX IF NOT EXISTS idx_incidents_created_at   ON incidents (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_anomalies_detected   ON anomalies (detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_anomalies_status     ON anomalies (status);
+CREATE INDEX IF NOT EXISTS idx_incidents_status     ON incidents (status);
+CREATE INDEX IF NOT EXISTS idx_incidents_created_at ON incidents (created_at DESC);

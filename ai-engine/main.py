@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from sqlalchemy import create_engine, text
 
 from features import fetch_feature_matrix, latest_values
-from models.isolation_forest import IsolationForestDetector
+from models.isolation_forest import IsolationForestDetector, required_min_samples
 from models.correlator import correlate, get_open_incidents
 
 logging.basicConfig(
@@ -30,8 +30,35 @@ CONTAMINATION = float(os.getenv("ANOMALY_CONTAMINATION", 0.03))
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL", "")
 MONITORED_INSTANCE = os.getenv("MONITORED_INSTANCE", "node-server")
 
-# Prevent training on old Prometheus history after an AI engine restart.
-# The model will use only samples collected after this process started.
+# FIX 2: Warmup period — ignore all data collected during system startup.
+# Docker services, image pulls, and init scripts produce artificial spikes
+# that corrupt the training baseline if included.
+# 600 seconds (10 minutes) is the minimum safe warmup for a full stack.
+WARMUP_SECONDS = int(os.getenv("WARMUP_SECONDS", 600))
+
+# FIX 6: Alert cooldown per family — minimum seconds between incidents
+# of the same family. Prevents the same issue from firing every 60 seconds.
+ALERT_COOLDOWN_SECONDS = {
+    "cpu_pressure": 300,
+    "memory_pressure": 300,
+    "storage_pressure": 600,
+    "network_pressure": 300,
+    "application_pressure": 180,
+    "unknown": 300,
+}
+
+# FIX 5: Consecutive anomaly confirmation per family.
+# Require N consecutive anomalous cycles before creating an incident.
+# This eliminates single-spike false positives entirely.
+CONFIRMATION_REQUIRED = {
+    "cpu_pressure": 2,
+    "memory_pressure": 2,
+    "storage_pressure": 3,   # disk metrics are noisy — require more confirmation
+    "network_pressure": 3,
+    "application_pressure": 2,
+    "unknown": 2,
+}
+
 ENGINE_START_TS = time.time()
 
 db_engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -48,6 +75,13 @@ state = {
     "last_alert_ts": 0.0,
     "last_alert_keys": set(),
     "model_loaded_from_disk": model_loaded,
+
+    # FIX 5: Track consecutive anomaly counts per family
+    # Resets to 0 when a family has no anomaly in a cycle
+    "consecutive_anomaly_counts": {},
+
+    # FIX 6: Track last alert timestamp per family
+    "last_family_alert_ts": {},
 }
 
 
@@ -206,8 +240,7 @@ def _dedup_latest(raw_anomalies):
 def _filter_if_only_anomalies(anomalies):
     """
     Isolation Forest alone is treated as a weak exploratory signal.
-    In the final system, real incidents require z-score or hard-threshold
-    confirmation. This prevents false CPU/storage incidents from IF-only scores.
+    Real incidents require z-score or hard-threshold confirmation.
     """
     filtered = []
 
@@ -228,9 +261,107 @@ def _filter_if_only_anomalies(anomalies):
     return filtered
 
 
+def _apply_confirmation_window(anomalies):
+    """
+    FIX 5: Consecutive confirmation window.
+
+    Require N consecutive anomalous cycles per family before firing.
+    This eliminates single-spike false positives entirely.
+
+    Logic:
+    - For each family present in this cycle's anomalies → increment counter
+    - For each family NOT present this cycle → reset counter to 0
+    - Only pass anomalies whose family counter >= CONFIRMATION_REQUIRED
+    """
+    current_families = {a.get("family") for a in anomalies}
+
+    # Increment counters for active families
+    for family in current_families:
+        state["consecutive_anomaly_counts"][family] = (
+            state["consecutive_anomaly_counts"].get(family, 0) + 1
+        )
+
+    # Reset counters for families that had no anomaly this cycle
+    for family in list(state["consecutive_anomaly_counts"]):
+        if family not in current_families:
+            if state["consecutive_anomaly_counts"][family] > 0:
+                log.info(
+                    f"Family {family} cleared — "
+                    f"resetting consecutive count from "
+                    f"{state['consecutive_anomaly_counts'][family]} to 0"
+                )
+            state["consecutive_anomaly_counts"][family] = 0
+
+    # Filter: only pass anomalies that have hit their confirmation threshold
+    confirmed = []
+    for anomaly in anomalies:
+        family = anomaly.get("family", "unknown")
+        count = state["consecutive_anomaly_counts"].get(family, 0)
+        required = CONFIRMATION_REQUIRED.get(family, 2)
+
+        if count >= required:
+            confirmed.append(anomaly)
+        else:
+            log.info(
+                f"Confirmation pending for {family}: "
+                f"{count}/{required} consecutive cycles"
+            )
+
+    return confirmed
+
+
+def _apply_cooldown_filter(anomalies):
+    """
+    FIX 6: Alert cooldown per family.
+
+    Suppress anomalies whose family was alerted within the cooldown window.
+    This prevents the same incident from firing every 60 seconds.
+    """
+    now = time.time()
+    passed = []
+
+    for anomaly in anomalies:
+        family = anomaly.get("family", "unknown")
+        last_ts = state["last_family_alert_ts"].get(family, 0)
+        cooldown = ALERT_COOLDOWN_SECONDS.get(family, 300)
+        elapsed = now - last_ts
+
+        if elapsed < cooldown:
+            remaining = int(cooldown - elapsed)
+            log.info(
+                f"Cooldown active for {family} — "
+                f"{remaining}s remaining, suppressing alert"
+            )
+            continue
+
+        passed.append(anomaly)
+
+    return passed
+
+
+def _update_cooldown_timestamps(anomalies):
+    """Update last alert timestamps for families that passed cooldown."""
+    now = time.time()
+    for anomaly in anomalies:
+        family = anomaly.get("family", "unknown")
+        state["last_family_alert_ts"][family] = now
+
+
 def analysis_loop():
     while True:
         try:
+            # FIX 2: Warmup period — skip data collection and training
+            # during the initial startup window to avoid boot artifacts.
+            elapsed_since_start = time.time() - ENGINE_START_TS
+            if elapsed_since_start < WARMUP_SECONDS:
+                remaining = int(WARMUP_SECONDS - elapsed_since_start)
+                log.info(
+                    f"Warmup period active — {remaining}s remaining. "
+                    "Skipping to avoid boot artifact contamination."
+                )
+                time.sleep(SCRAPE_INTERVAL)
+                continue
+
             matrix = fetch_feature_matrix(
                 PROMETHEUS_URL,
                 instance=MONITORED_INSTANCE,
@@ -246,11 +377,35 @@ def analysis_loop():
             names = matrix.feature_names
             timestamps = matrix.timestamps
 
+            # FIX 8: Check per-metric minimum sample requirement
+            min_required = required_min_samples(names)
+
             if not detector.trained:
-                detector.train(X, names)
+                if len(X) < min_required:
+                    log.info(
+                        f"Collecting samples: {len(X)}/{min_required} "
+                        f"(per-metric minimum for present features)"
+                    )
+                    time.sleep(SCRAPE_INTERVAL)
+                    continue
+
+                # FIX 1: train() now validates CV and returns True/False
+                success = detector.train(X, names)
+
+                if not success:
+                    log.warning(
+                        "Training rejected due to poor baseline quality. "
+                        f"Collecting more samples and retrying in {SCRAPE_INTERVAL}s."
+                    )
+                    time.sleep(SCRAPE_INTERVAL)
+                    continue
+
                 state["last_trained_at"] = detector.saved_at
                 state["model_loaded_from_disk"] = False
-                log.info("Initial training complete.")
+                log.info(
+                    f"Initial training complete on {len(X)} samples. "
+                    "Detection is now active."
+                )
                 time.sleep(SCRAPE_INTERVAL)
                 continue
 
@@ -258,10 +413,16 @@ def analysis_loop():
             latest_compact = _dedup_latest(raw)
             filtered = _filter_if_only_anomalies(latest_compact)
 
+            # FIX 5: Apply consecutive confirmation window
+            confirmed = _apply_confirmation_window(filtered)
+
+            # FIX 6: Apply cooldown filter
+            cooldown_passed = _apply_cooldown_filter(confirmed)
+
             new_anomalies = []
             new_keys = set()
 
-            for anomaly in filtered:
+            for anomaly in cooldown_passed:
                 key = anomaly_key(anomaly)
 
                 if (
@@ -277,6 +438,8 @@ def analysis_loop():
                 f"raw={len(raw)} "
                 f"latest_compact={len(latest_compact)} "
                 f"filtered={len(filtered)} "
+                f"confirmed={len(confirmed)} "
+                f"cooldown_passed={len(cooldown_passed)} "
                 f"new={len(new_anomalies)}"
             )
 
@@ -294,6 +457,9 @@ def analysis_loop():
                 for anomaly in new_anomalies
             )
             state["last_alert_keys"] = new_keys
+
+            # Update cooldown timestamps for families that are firing
+            _update_cooldown_timestamps(new_anomalies)
 
             for anomaly in new_anomalies:
                 db_id = save_anomaly(matrix.instance, anomaly)
@@ -322,7 +488,7 @@ def analysis_loop():
         time.sleep(SCRAPE_INTERVAL)
 
 
-app = FastAPI(title="AI Monitoring Engine", version="5.2.0")
+app = FastAPI(title="AI Monitoring Engine", version="6.0.0")
 
 
 @app.on_event("startup")
@@ -330,7 +496,11 @@ def startup():
     wait_for_db()
     Thread(target=heartbeat_loop, daemon=True).start()
     Thread(target=analysis_loop, daemon=True).start()
-    log.info("AI engine v5.2.0 started.")
+    log.info(
+        f"AI engine v6.0.0 started. "
+        f"Warmup: {WARMUP_SECONDS}s. "
+        f"Detection active after warmup + {required_min_samples(['cpu_pct','mem_pct','disk_fill_pct','disk_io','net_traffic','http_requests'])} samples."
+    )
 
 
 @app.get("/health")
@@ -338,7 +508,9 @@ def health():
     return {
         "status": "ok",
         "model_trained": detector.trained,
+        "baseline_quality_passed": detector.baseline_quality_passed,
         "cycle_count": state["cycle_count"],
+        "warmup_remaining": max(0, int(WARMUP_SECONDS - (time.time() - ENGINE_START_TS))),
     }
 
 
@@ -373,6 +545,7 @@ def get_alerts():
 def status():
     return {
         "model_trained": detector.trained,
+        "baseline_quality_passed": detector.baseline_quality_passed,
         "last_trained_at": state["last_trained_at"],
         "last_cycle_at": state["last_cycle_at"],
         "cycle_count": state["cycle_count"],
@@ -381,4 +554,11 @@ def status():
         "instance": MONITORED_INSTANCE,
         "model_loaded_from_disk": state["model_loaded_from_disk"],
         "engine_start_ts": ENGINE_START_TS,
+        "warmup_seconds": WARMUP_SECONDS,
+        "warmup_remaining": max(0, int(WARMUP_SECONDS - (time.time() - ENGINE_START_TS))),
+        "consecutive_anomaly_counts": state["consecutive_anomaly_counts"],
+        "last_family_alert_ts": {
+            k: datetime.utcfromtimestamp(v).isoformat()
+            for k, v in state["last_family_alert_ts"].items()
+        },
     }

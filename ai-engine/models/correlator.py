@@ -43,6 +43,22 @@ OPEN_STATUSES = (
     "manual_required",
 )
 
+# CHANGE 1: Per-family incident reuse window in minutes.
+# Previously all families used a flat 20-minute window.
+# Storage pressure changes slowly — reuse window is longer to avoid duplicates.
+# Application anomalies are fast-changing — shorter reuse window.
+# These are aligned with the cooldown windows in main.py.
+INCIDENT_REUSE_MINUTES = {
+    "CPU overload": 30,
+    "Memory exhaustion": 30,
+    "Storage pressure": 60,       # disk changes slowly, long reuse window
+    "Network saturation": 45,
+    "Application anomaly": 20,
+    "System anomaly": 30,
+}
+
+DEFAULT_REUSE_MINUTES = 30
+
 
 def correlate(anomalies):
     if not anomalies:
@@ -81,8 +97,16 @@ def correlate(anomalies):
         technical_reason = " | ".join(reasons[:3])
         title = f"[{severity.upper()}] {root_cause} — {len(group)} signal(s)"
 
+        # CHANGE 2: Aggregate max confidence from the anomaly group
+        max_confidence = max(
+            anomaly.get("confidence", 50)
+            for anomaly in group
+        )
+
         try:
-            open_incident = _find_matching_open_incident(root_cause)
+            # CHANGE 1: Use per-family reuse window
+            reuse_minutes = INCIDENT_REUSE_MINUTES.get(root_cause, DEFAULT_REUSE_MINUTES)
+            open_incident = _find_matching_open_incident(root_cause, reuse_minutes)
 
             if open_incident:
                 incident_id = open_incident["id"]
@@ -93,6 +117,7 @@ def correlate(anomalies):
                     new_severity=severity,
                     title=title,
                     technical_reason=technical_reason,
+                    confidence=max_confidence,
                 )
             else:
                 incident_id = _save(
@@ -100,6 +125,7 @@ def correlate(anomalies):
                     severity=severity,
                     root_cause=root_cause,
                     technical_reason=technical_reason,
+                    confidence=max_confidence,
                 )
 
             if not incident_id:
@@ -119,12 +145,14 @@ def correlate(anomalies):
                 "reason": technical_reason,
                 "anomaly_count": len(group),
                 "family": family,
+                "confidence": max_confidence,
                 "created_at": datetime.utcnow().isoformat(),
             })
 
             log.warning(
                 f"INCIDENT [{severity.upper()}] "
-                f"{root_cause} — {len(group)} anomaly(ies)"
+                f"{root_cause} — {len(group)} anomaly(ies) | "
+                f"confidence={max_confidence}"
             )
 
         except Exception as e:
@@ -136,10 +164,12 @@ def correlate(anomalies):
     return incidents
 
 
-def _find_matching_open_incident(root_cause):
+def _find_matching_open_incident(root_cause, reuse_minutes):
     """
-    Reuse a recent open incident for the same root cause.
-    Severity is not part of the match because the same incident can escalate.
+    CHANGE 1: Reuse window is now per-family instead of flat 20 minutes.
+
+    Finds the most recent open incident for the same root cause
+    within the family-specific reuse window.
     """
     try:
         with engine.connect() as conn:
@@ -154,10 +184,13 @@ def _find_matching_open_incident(root_cause):
                       'in_progress',
                       'manual_required'
                   )
-                  AND created_at >= NOW() - INTERVAL '20 minutes'
+                  AND created_at >= NOW() - (:minutes * INTERVAL '1 minute')
                 ORDER BY created_at DESC
                 LIMIT 1
-            """), dict(root_cause=root_cause)).fetchone()
+            """), dict(
+                root_cause=root_cause,
+                minutes=reuse_minutes,
+            )).fetchone()
 
             if not row:
                 return None
@@ -172,7 +205,13 @@ def _find_matching_open_incident(root_cause):
         return None
 
 
-def _save(title, severity, root_cause, technical_reason):
+def _save(title, severity, root_cause, technical_reason, confidence=50):
+    """
+    CHANGE 2: confidence parameter added and stored in DB.
+    Requires the incidents table to have a confidence column (integer).
+    Add via migration if not present:
+        ALTER TABLE incidents ADD COLUMN IF NOT EXISTS confidence INTEGER DEFAULT 50;
+    """
     try:
         with engine.begin() as conn:
             row = conn.execute(text("""
@@ -181,6 +220,7 @@ def _save(title, severity, root_cause, technical_reason):
                     severity,
                     root_cause,
                     technical_reason,
+                    confidence,
                     status
                 )
                 VALUES (
@@ -188,6 +228,7 @@ def _save(title, severity, root_cause, technical_reason):
                     :severity,
                     :root_cause,
                     :technical_reason,
+                    :confidence,
                     'new'
                 )
                 RETURNING id
@@ -196,11 +237,15 @@ def _save(title, severity, root_cause, technical_reason):
                 severity=severity,
                 root_cause=root_cause,
                 technical_reason=technical_reason,
+                confidence=confidence,
             ))
 
             incident_id = row.fetchone()[0]
 
-            log.info(f"Created incident id={incident_id} title={title}")
+            log.info(
+                f"Created incident id={incident_id} "
+                f"title={title} confidence={confidence}"
+            )
             return incident_id
 
     except Exception as e:
@@ -214,9 +259,11 @@ def _update_incident_if_needed(
     new_severity,
     title,
     technical_reason,
+    confidence=50,
 ):
     """
     Escalate/update an existing open incident instead of creating duplicates.
+    CHANGE 2: Also updates confidence if the new value is higher.
     """
     current_rank = SEVERITY_RANK.get(current_severity, 1)
     new_rank = SEVERITY_RANK.get(new_severity, 1)
@@ -230,18 +277,21 @@ def _update_incident_if_needed(
                 UPDATE incidents
                 SET severity = :severity,
                     title = :title,
-                    technical_reason = :technical_reason
+                    technical_reason = :technical_reason,
+                    confidence = GREATEST(COALESCE(confidence, 0), :confidence)
                 WHERE id = :id
             """), dict(
                 id=incident_id,
                 severity=new_severity,
                 title=title,
                 technical_reason=technical_reason,
+                confidence=confidence,
             ))
 
         log.info(
             f"Escalated incident id={incident_id} "
-            f"from {current_severity} to {new_severity}"
+            f"from {current_severity} to {new_severity} | "
+            f"confidence={confidence}"
         )
 
     except Exception as e:
@@ -291,6 +341,7 @@ def get_open_incidents():
                     root_cause,
                     technical_reason,
                     llm_summary,
+                    confidence,
                     status,
                     created_at
                 FROM incidents
@@ -313,8 +364,9 @@ def get_open_incidents():
                     root_cause=row[3],
                     technical_reason=row[4],
                     llm_summary=row[5],
-                    status=row[6],
-                    created_at=row[7].isoformat() if row[7] else None,
+                    confidence=row[6],
+                    status=row[7],
+                    created_at=row[8].isoformat() if row[8] else None,
                 )
                 for row in rows
             ]
